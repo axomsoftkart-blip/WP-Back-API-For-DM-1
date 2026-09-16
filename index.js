@@ -50,7 +50,7 @@ async function startSock() {
       auth: state,
       printQRInTerminal: false,
       markOnlineOnConnect: false,
-      browser: ["Bagheera Billing OS", "Chrome", "1.0.0"],
+      browser: ["Bulk WhatsApp API", "Chrome", "1.0.0"],
       logger: pino({ level: process.env.LOG_LEVEL || "silent" }),
       syncFullHistory: false,
       generateHighQualityLinkPreview: false
@@ -103,31 +103,6 @@ function jidFor(number) {
   return `${cleaned}@s.whatsapp.net`;
 }
 
-function normalizeDocumentPayload(body) {
-  const fileName = sanitizeFileName(body.fileName || body.filename || "Bagheera_Document.html");
-  const mimetype = body.mimeType || body.mimetype || "text/html";
-  let buffer;
-
-  if (body.base64) {
-    const raw = String(body.base64).replace(/^data:[^;]+;base64,/, "");
-    buffer = Buffer.from(raw, "base64");
-  } else if (body.html) {
-    buffer = Buffer.from(String(body.html), "utf8");
-  } else if (body.textFile) {
-    buffer = Buffer.from(String(body.textFile), "utf8");
-  } else {
-    throw httpError(400, "Document payload must include html or base64.");
-  }
-
-  if (!buffer.length) throw httpError(400, "Document payload is empty.");
-  return { fileName, mimetype, buffer };
-}
-
-function sanitizeFileName(fileName) {
-  const safe = String(fileName || "document.html").replace(/[\\/:*?"<>|]+/g, "_").trim();
-  return safe || "document.html";
-}
-
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms || 0))));
 }
@@ -143,10 +118,14 @@ function sendError(res, err) {
   res.status(status).json({ ok: false, message: err.message || "Internal error" });
 }
 
+// ---------------------------------------------------------
+// Endpoints (Routes)
+// ---------------------------------------------------------
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "Bagheera WhatsApp API",
+    service: "Bulk WhatsApp API",
     ready: Boolean(sock && sock.user && sock.user.id),
     qrAvailable: Boolean(currentQR)
   });
@@ -169,7 +148,7 @@ app.get("/qr", (req, res) => {
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scan WhatsApp QR</title></head>
 <body style="display:flex;min-height:100vh;align-items:center;justify-content:center;flex-direction:column;background:#f0f2f5;font-family:Arial,sans-serif">
-  <h2>Scan with WhatsApp Business</h2>
+  <h2>Scan to Link WhatsApp</h2>
   <div id="qrcode" style="background:white;padding:20px;border-radius:12px;box-shadow:0 10px 25px rgba(15,23,42,.18)"></div>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <script>new QRCode(document.getElementById("qrcode"),{text:${JSON.stringify(currentQR)},width:256,height:256});</script>
@@ -177,65 +156,42 @@ app.get("/qr", (req, res) => {
 </html>`);
 });
 
-app.post("/send-message", async (req, res) => {
+// Bulk Messaging Endpoint (Called by Apps Script)
+app.post("/send", async (req, res) => {
   try {
     assertReady();
-    const { number, message } = req.body || {};
+    const { numbers, message } = req.body || {};
+    
     if (!message) throw httpError(400, "Message is required.");
-    await sock.sendMessage(jidFor(number), { text: String(message) });
-    res.json({ ok: true, type: "message" });
-  } catch (err) {
-    sendError(res, err);
-  }
-});
-
-app.post("/send-document", async (req, res) => {
-  try {
-    assertReady();
-    const { number, message, caption } = req.body || {};
-    const doc = normalizeDocumentPayload(req.body || {});
-    await sock.sendMessage(jidFor(number), {
-      document: doc.buffer,
-      mimetype: doc.mimetype,
-      fileName: doc.fileName,
-      caption: String(caption || message || "")
-    });
-    res.json({ ok: true, type: "document", fileName: doc.fileName, bytes: doc.buffer.length });
-  } catch (err) {
-    sendError(res, err);
-  }
-});
-
-app.post("/send-sequence", async (req, res) => {
-  try {
-    assertReady();
-    const body = req.body || {};
-    const number = body.number;
-    const firstMessage = body.firstMessage || body.message || "";
-    const followupMessage = body.followupMessage || "";
-    const delayMs = body.delayMs == null ? 2000 : Number(body.delayMs);
-    const documentBody = {
-      fileName: body.firstFileName || body.fileName || "Receipt.html",
-      mimeType: body.firstMimeType || body.mimeType || "text/html",
-      html: body.firstHtml || body.html,
-      base64: body.firstBase64 || body.base64
-    };
-    const doc = normalizeDocumentPayload(documentBody);
-    const jid = jidFor(number);
-
-    await sock.sendMessage(jid, {
-      document: doc.buffer,
-      mimetype: doc.mimetype,
-      fileName: doc.fileName,
-      caption: String(firstMessage)
-    });
-
-    if (followupMessage) {
-      await sleep(delayMs);
-      await sock.sendMessage(jid, { text: String(followupMessage) });
+    if (!numbers || !Array.isArray(numbers) || numbers.length === 0) {
+      throw httpError(400, "Valid array of phone numbers is required.");
     }
 
-    res.json({ ok: true, type: "sequence", fileName: doc.fileName, bytes: doc.buffer.length, delayMs });
+    // Acknowledge immediately to Apps Script so it doesn't wait indefinitely
+    res.json({ ok: true, type: "bulk-message", queuedCount: numbers.length });
+
+    // Process numbers sequentially in the background
+    (async () => {
+      for (let i = 0; i < numbers.length; i++) {
+        const number = numbers[i];
+        try {
+          const jid = jidFor(number);
+          await sock.sendMessage(jid, { text: String(message) });
+          console.log(`Message sent to ${number}`);
+        } catch (err) {
+          console.error(`Failed to send to ${number}:`, err.message);
+        }
+
+        // Apply random delay between 5000ms (5s) and 30000ms (30s) if it's not the last number
+        if (i < numbers.length - 1) {
+          const delayMs = Math.floor(Math.random() * (30000 - 5000 + 1)) + 5000;
+          console.log(`Waiting ${delayMs}ms before next message...`);
+          await sleep(delayMs);
+        }
+      }
+      console.log("Bulk message batch completed.");
+    })();
+
   } catch (err) {
     sendError(res, err);
   }
@@ -247,6 +203,6 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Bagheera WhatsApp API listening on ${PORT}`);
+  console.log(`Bulk WhatsApp API listening on ${PORT}`);
   startSock();
 });
