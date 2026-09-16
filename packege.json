@@ -1,7 +1,7 @@
 {
-  "name": "bagheera-whatsapp-api",
+  "name": "whatsapp-bulk-api",
   "version": "1.0.0",
-  "description": "Low-memory Baileys WhatsApp API for Bagheera Billing OS",
+  "description": "Stable Baileys WhatsApp API for Bulk Messaging",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
